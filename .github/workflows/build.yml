@@ -1,0 +1,159 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ "*" ]   # 任意分支推送触发，可按需修改
+
+jobs:
+  # Linux 作业：构建 Android、Web 和 Linux
+  build_linux:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0'   # 或 'stable'
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # 提取版本号（用于产物命名）
+      - name: Extract version from pubspec.yaml
+        id: version
+        run: |
+          VERSION=$(grep 'version:' pubspec.yaml | awk '{print $2}' | tr -d "'\"")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+# ---------- Android 签名准备（环境变量方案）----------
+- name: Decode keystore
+  run: |
+    mkdir -p android/app
+    echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+
+- name: Build Android APKs with environment variables
+  env:
+    KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+    KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    KEYSTORE_PATH: android/app/keystore.jks
+    KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+    CI: true
+  run: |
+    flutter build apk --release --split-per-abi
+    mkdir -p artifacts/android
+    cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk artifacts/android/ 2>/dev/null || true
+    cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk artifacts/android/ 2>/dev/null || true
+    cp build/app/outputs/flutter-apk/app-x86_64-release.apk artifacts/android/ 2>/dev/null || true
+      # ---------- Web 构建 ----------
+      - name: Build Web
+        run: |
+          flutter build web
+          cd build/web
+          zip -r ../../artifacts/web-${{ env.VERSION }}.zip .
+          cd ../..
+
+      # ---------- Linux 构建 ----------
+      - name: Build Linux
+        run: |
+          flutter build linux
+          # 打包 tar.gz
+          cd build/linux/x64/release/bundle
+          tar -czf ../../../../artifacts/fluffychat-linux-${{ env.VERSION }}.tar.gz .
+          cd ../../../..
+
+          # （可选）构建 deb 包 - 若不需要可注释掉
+          mkdir -p deb/opt/fluffychat
+          cp -r build/linux/x64/release/bundle/* deb/opt/fluffychat/
+          mkdir -p deb/usr/bin
+          ln -s /opt/fluffychat/fluffychat deb/usr/bin/fluffychat
+          mkdir -p deb/DEBIAN
+          cat > deb/DEBIAN/control <<EOF
+          Package: fluffychat
+          Version: ${{ env.VERSION }}
+          Architecture: amd64
+          Maintainer: Your Name <you@example.com>
+          Description: FluffyChat messenger client
+          Section: utils
+          Priority: optional
+          Homepage: https://fluffychat.im
+          EOF
+          dpkg-deb --build deb artifacts/fluffychat-linux-${{ env.VERSION }}.deb
+
+      - name: Upload artifacts (for release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: artifacts/
+
+  # Windows 作业：构建 Windows 版本（不签名）
+  build_windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0'
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Windows (unsigned)
+        run: |
+          flutter build windows
+          # 压缩 Release 目录为 zip
+          Compress-Archive -Path build\windows\runner\Release\* -DestinationPath windows.zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifact
+          path: windows.zip
+
+  # 发布 Release：收集所有产物并创建 Release
+  release:
+    needs: [build_linux, build_windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract version
+        id: version
+        run: |
+          echo "VERSION=${{ needs.build_linux.outputs.version }}" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}-${{ github.run_number }}
+          name: Release v${{ env.VERSION }} build ${{ github.run_number }}
+          files: |
+            artifacts/linux-artifacts/android/*
+            artifacts/linux-artifacts/*.zip
+            artifacts/linux-artifacts/*.tar.gz
+            artifacts/linux-artifacts/*.deb
+            artifacts/windows-artifact/windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
